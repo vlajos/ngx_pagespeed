@@ -45,6 +45,7 @@ extern "C" {
 
 #include "ngx_pagespeed.h"
 
+#include "ngx_event_connection.h"
 #include "ngx_server_context.h"
 
 #include "net/instaweb/http/public/async_fetch.h"
@@ -53,13 +54,19 @@ extern "C" {
 
 namespace net_instaweb {
 
+
 class NgxBaseFetch : public AsyncFetch {
  public:
-  NgxBaseFetch(ngx_http_request_t* r, int pipe_fd,
-               NgxServerContext* server_context,
+  NgxBaseFetch(ngx_http_request_t* r, NgxServerContext* server_context,
                const RequestContextPtr& request_ctx,
                PreserveCachingHeaders preserve_caching_headers);
   virtual ~NgxBaseFetch();
+  // Statically initializes event_connection, require for PSOL and nginx to
+  // communicate.
+  static bool Initialize(ngx_cycle_t* cycle);
+  // Statically terminates and NULLS event_connection.
+  static void Terminate();
+  static void ReadCallback(const ps_event_data& data);
 
   // Puts a chain in link_ptr if we have any output data buffered.  Returns
   // NGX_OK on success, NGX_ERROR on errors.  If there's no data to send, sends
@@ -77,9 +84,23 @@ class NgxBaseFetch : public AsyncFetch {
   // time for resource fetches.  Not called at all for proxy fetches.
   ngx_int_t CollectHeaders(ngx_http_headers_out_t* headers_out);
 
-  // Called by nginx when it's done with us.
-  void Release();
+  // Called by nginx to decrement the refcount.
+  int DecrementRefCount();
+
+  // Called by pagespeed to increment the refcount.
+  int IncrementRefCount();
+
   void set_ipro_lookup(bool x) { ipro_lookup_ = x; }
+
+  // Detach() is called when the nginx side releases this base fetch. It
+  // sets detached_ to true and decrements the refcount. We need to know
+  // this to be able to handle events which nginx request context has been
+  // released while the event was in-flight.
+  void Detach() { detached_ = true; DecrementRefCount(); }
+
+  bool detached() { return detached_; }
+
+  ngx_http_request_t* request() { return request_; }
 
  private:
   virtual bool HandleWrite(const StringPiece& sp, MessageHandler* handler);
@@ -89,7 +110,7 @@ class NgxBaseFetch : public AsyncFetch {
 
   // Indicate to nginx that we would like it to call
   // CollectAccumulatedWrites().
-  void RequestCollection();
+  void RequestCollection(char type);
 
   // Lock must be acquired first.
   // Returns:
@@ -105,20 +126,25 @@ class NgxBaseFetch : public AsyncFetch {
 
   // Called by Done() and Release().  Decrements our reference count, and if
   // it's zero we delete ourself.
-  void DecrefAndDeleteIfUnreferenced();
+  int DecrefAndDeleteIfUnreferenced();
+
+  static NgxEventConnection* event_connection;
 
   ngx_http_request_t* request_;
   GoogleString buffer_;
   NgxServerContext* server_context_;
   bool done_called_;
   bool last_buf_sent_;
-  int pipe_fd_;
   // How many active references there are to this fetch. Starts at two,
   // decremented once when Done() is called and once when Release() is called.
+  // Incremented for each event written by pagespeed for this NgxBaseFetch, and
+  // decremented on the nginx side for each event read for it.
   int references_;
   pthread_mutex_t mutex_;
   bool ipro_lookup_;
   PreserveCachingHeaders preserve_caching_headers_;
+  // Set to true just before the nginx side releases its reference
+  bool detached_;
 
   DISALLOW_COPY_AND_ASSIGN(NgxBaseFetch);
 };
